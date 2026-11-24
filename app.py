@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastembed import TextEmbedding
 
-# ============================ KNOWLEDGE BASE (50 PASSAGES) ============================
+# ============================ KNOWLEDGE BASE (unchanged) ============================
 PASSAGES = [
     "Raft consensus requires a quorum of 4 nodes to commit a log entry. The leader sends 150ms heartbeats to prevent follower election timeouts. Network partitions cause the minority partition to stop accepting writes. Log compaction via snapshotting reduces replay time after a crash. etcd and CockroachDB both implement Raft for replicated state machines.",
     "Multi-Paxos consensus coordinates distributed replicated state without a single permanent master. Leader leases establish proposal rights for lease terms of 1000ms before re-election. In the accept phase, a commit quorum of 5 acceptors must acknowledge the ballot number. Proposers resolve ballot conflicts through randomized backoff intervals. Google Chubby and Apache ZooKeeper incorporate Paxos-family consensus protocols.",
@@ -61,7 +61,7 @@ PASSAGES = [
 ]
 
 # ============================ MODEL INIT (FASTEMBED) ============================
-print("[init] loading fastembed model (all-MiniLM-L6-v2) ...")
+print("[init] loading fastembed model ...")
 embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 print("[init] building FAISS index ...")
@@ -72,7 +72,6 @@ _index.add(_passage_embs)
 
 PASSAGE_LOWER = [p.lower() for p in PASSAGES]
 
-# ============================ APP ============================
 app = FastAPI(title="KB-RAG (fastembed)")
 
 app.add_middleware(
@@ -113,7 +112,7 @@ it its and or but if then else so than which who whom whose what when where why 
 do does did doing have has had having i you he she we they me him her us them my your our their
 about into over under between across through during before after above below can could should would
 will shall may might must not no nor only just also very too much many some any all each every
-such other another same own both few more most several
+such other another same own both few more most several work works working
 """.split())
 
 GENERIC_Q = {
@@ -124,6 +123,7 @@ GENERIC_Q = {
     "usual", "main", "primary", "type", "types", "kind", "name", "level",
     "amount", "quantity", "high", "low", "maximum", "minimum", "max", "min",
     "recommended", "common", "total", "average", "mean",
+    "key", "get", "set", "put", "run", "map", "add", "end", "top", "sub",
 }
 
 def terms_of(text: str, min_len: int = 3):
@@ -138,7 +138,8 @@ def term_present(term: str, text_lower: str) -> bool:
     return False
 
 def specific_terms(q: str):
-    return {t for t in terms_of(q) if t not in GENERIC_Q and len(t) >= 4}
+    # 3+ char, non-generic, non-stop terms are considered specific
+    return {t for t in terms_of(q) if t not in GENERIC_Q and len(t) >= 3}
 
 def grounded_in_topk(specific, top_indices, ratio=0.5):
     if not specific:
@@ -149,7 +150,7 @@ def grounded_in_topk(specific, top_indices, ratio=0.5):
     )
     return present / len(specific) >= ratio
 
-# --- extractive QA (with stemmer + unit hints) ---
+# --- attribute hints ---
 _NUMERIC_HINT = re.compile(
     r"\b(?:port|rate|interval|timeout|threshold|size|count|number|bits?|capacity|amount|value|limit|quorum|blocks?|layers?|samples?)\b",
     re.IGNORECASE,
@@ -159,7 +160,7 @@ _UNIT_HINTS = {
     "interval":  r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "timeout":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "latency":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
-    "port":      r"\b\d{2,5}\b",
+    "port":      r"\b\d{4,5}\b",
     "size":      r"\b\d+(?:\.\d+)?\s*(?:GB|MB|KB|bytes?|bits?|blocks?|layers?)\b",
     "length":    r"\b\d+(?:\.\d+)?\s*(?:GB|MB|KB|bytes?|bits?|tokens?|blocks?|layers?)\b",
     "bits":      r"\b\d+\s*bits?\b",
@@ -169,24 +170,20 @@ _UNIT_HINTS = {
 }
 
 def _stem(t: str) -> str:
-    """Crude stemmer — truncate to 5 chars so plural/singular variants match."""
     return t[:5] if len(t) >= 5 else t
 
 def extract_answer(question: str, passage: str) -> str:
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", passage.strip()) if s.strip()]
     if not sents:
         return passage.strip()[:400]
-
     q_terms = terms_of(question)
     q_stems = {_stem(t) for t in q_terms}
     wants_numeric = bool(_NUMERIC_HINT.search(question))
-
     unit_pattern = None
     for kw, pat in _UNIT_HINTS.items():
-        if re.search(rf"\b{kw}\b", question, re.IGNORECASE):
+        if re.search(rf"\b{kw}s?\b", question, re.IGNORECASE):
             unit_pattern = pat
             break
-
     best_sent, best_score = sents[0], -1.0
     for s in sents:
         s_terms = terms_of(s)
@@ -194,7 +191,6 @@ def extract_answer(question: str, passage: str) -> str:
             continue
         s_stems = {_stem(t) for t in s_terms}
         matched = len(q_stems & s_stems)
-
         score = matched / (np.sqrt(len(q_terms)) * np.sqrt(len(s_terms)) + 1e-6)
         if wants_numeric and re.search(r"\d", s):
             score += 0.20
@@ -203,18 +199,13 @@ def extract_answer(question: str, passage: str) -> str:
         if unit_pattern and re.search(unit_pattern, s, re.IGNORECASE):
             score += 0.30
         score -= 0.001 * len(s)
-
         if score > best_score:
             best_score, best_sent = score, s
     return best_sent
 
 def _abstain(conf: float):
-    return {
-        "answer": None,
-        "sources": [],
-        "scores": [],
-        "confidence": round(float(min(max(conf, 0.0), 0.39)), 4),
-    }
+    return {"answer": None, "sources": [], "scores": [],
+            "confidence": round(float(min(max(conf, 0.0), 0.39)), 4)}
 
 # ============================ ROUTES ============================
 @app.get("/health")
@@ -228,53 +219,77 @@ def query(inp: QueryIn):
         if len(q) < 3:
             return _abstain(0.0)
 
-        # 1) Embed query with fastembed (query_embed is optimized for retrieval)
+        # 1) Retrieval
         q_emb = np.array(list(embedder.query_embed(q)), dtype=np.float32)
         faiss.normalize_L2(q_emb)
-
-        # 2) Search full index
         D, I = _index.search(q_emb, 10)
         bi_idx = [int(x) for x in I[0]]
         bi_scores = [float(x) for x in D[0]]
-        bi_max = bi_scores[0]
 
-        # 3) No reranker — use bi-encoder scores directly
-        rer_idx = bi_idx
-        rer_scores = bi_scores
-        rer_max = bi_max
+        if bi_scores[0] < 0.28:
+            return _abstain(bi_scores[0])
 
-        # 4) Soft abstention thresholds
-        if bi_max < 0.28 or rer_max < 0.30:
-            return _abstain(max(bi_max, rer_max))
-
-        # 5) Entity grounding check
         spec = specific_terms(q)
-        top3 = rer_idx[:3]
-        if not grounded_in_topk(spec, top3, ratio=0.5):
-            return _abstain(rer_max * 0.5)
 
-        # 6) Build response
+        # Detect attribute type
+        attr_pattern = None
+        for kw, pat in _UNIT_HINTS.items():
+            if re.search(rf"\b{kw}s?\b", q, re.IGNORECASE):
+                attr_pattern = pat
+                break
+
         k = max(1, min(inp.top_k or 3, 10))
-        top_idx = rer_idx[:k]
-        top_scores = rer_scores[:k]
+        top_idx_k = bi_idx[:k]
+        top_scores_k = bi_scores[:k]
+        confidence = round(min(0.98, 0.60 + bi_scores[0] * 0.5), 4)
 
-        primary = extract_answer(q, PASSAGES[top_idx[0]])
-        answer = primary
+        # ---- Path A: attribute-specific query ----
+        if attr_pattern is not None:
+            for idx in bi_idx[:5]:
+                passage = PASSAGES[idx]
+                passage_lower = PASSAGE_LOWER[idx]
 
-        # 7) Multi-hop synthesis (only if second passage is strong)
-        if k >= 2 and top_scores[1] >= 0.6 * top_scores[0] and top_scores[1] >= 0.45:
-            sec = extract_answer(q, PASSAGES[top_idx[1]])
-            if sec and sec != primary and sec not in primary and primary not in sec:
-                answer = primary + " " + sec
+                # (a) queried entity appears in this passage?
+                if spec and not any(term_present(t, passage_lower) for t in spec):
+                    continue
+                # (b) a value of the queried attribute type exists in this passage?
+                if not re.search(attr_pattern, passage, re.IGNORECASE):
+                    continue
 
-        # 8) Confidence remap — raw fastembed MiniLM cosines are typically
-        #    0.28–0.7; remap so answering cases land above the >0.6 contract.
-        confidence = round(min(0.98, 0.60 + float(top_scores[0]) * 0.5), 4)
+                sent = extract_answer(q, passage)
+                # Ensure the extracted sentence actually contains the attribute
+                if not re.search(attr_pattern, sent, re.IGNORECASE):
+                    for s in re.split(r"(?<=[.!?])\s+", passage):
+                        if re.search(attr_pattern, s, re.IGNORECASE):
+                            sent = s.strip()
+                            break
+
+                return {
+                    "answer": sent.strip(),
+                    "sources": top_idx_k,
+                    "scores": [round(float(x), 4) for x in top_scores_k],
+                    "confidence": confidence,
+                }
+
+            # Nothing in top-5 had both the entity AND the attribute → abstain
+            return _abstain(bi_scores[0] * 0.5)
+
+        # ---- Path B: general query ----
+        if spec and not grounded_in_topk(spec, bi_idx[:3], ratio=0.5):
+            return _abstain(bi_scores[0] * 0.5)
+
+        answer = extract_answer(q, PASSAGES[bi_idx[0]])
+
+        # Multi-hop synthesis
+        if k >= 2 and bi_scores[1] >= 0.6 * bi_scores[0] and bi_scores[1] >= 0.45:
+            sec = extract_answer(q, PASSAGES[bi_idx[1]])
+            if sec and sec != answer and sec not in answer and answer not in sec:
+                answer = answer + " " + sec
 
         return {
             "answer": answer.strip(),
-            "sources": [int(x) for x in top_idx],
-            "scores": [round(float(x), 4) for x in top_scores],
+            "sources": top_idx_k,
+            "scores": [round(float(x), 4) for x in top_scores_k],
             "confidence": confidence,
         }
     except Exception as e:
