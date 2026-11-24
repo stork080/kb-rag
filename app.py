@@ -60,61 +60,43 @@ PASSAGES = [
     "JSON Web Tokens transmit cryptographically verifiable claims between distributed services in compact URL-safe strings. Digital signatures verify JWT payload tampering by generating cryptographic signatures using SHA-256 digests. Verification middleware rejects expired tokens when expiration timestamp differences exceed a 250ms clock skew threshold. Tokens comprise base64url-encoded header, payload, and cryptographic signature segments separated by periods. Stateless microservices use JWTs to transmit authenticated identity claims without querying central session stores.",
 ]
 
-# ============================ SYNONYM MAP (KEY FIX) ============================
-# Maps paraphrased terms to terms that actually appear in the KB passages.
-# If a query term is not in the passage, we check its synonym.
+# ============================ SYNONYM MAP ============================
 SYNONYMS = {
-    # Consensus / distributed systems
-    "keepalive":  "heartbeat",
-    "keepalives": "heartbeat",
-    "coordinator": "leader",
-    "coordinators": "leader",
-    "subordinate": "follower",
-    "subordinates": "follower",
-    "replicas":   "follower",
-    "replica":    "follower",
-    "trigger":    "timeout",
-    "triggers":   "timeout",
-    "periodic":   "interval",
-    "periodically": "interval",
-    "duration":   "interval",
+    "keepalive":  "heartbeat", "keepalives": "heartbeat",
+    "coordinator": "leader", "coordinators": "leader",
+    "subordinate": "follower", "subordinates": "follower",
+    "replicas":   "follower", "replica":    "follower",
+    "trigger":    "timeout", "triggers":   "timeout",
+    "periodic":   "interval", "periodically": "interval",
     "duration":   "interval",
     "signals":    "heartbeat",
-    "transmitted": "send",
-    "transmits":  "send",
-    "transmit":   "send",
-
-    # Optimizers / ML
-    "coefficient": "rate",
-    "coefficients": "rate",
-    "scalar":     "rate",
-    "scalars":    "rate",
+    "transmitted": "send", "transmits":  "send", "transmit":   "send",
+    "coefficient": "rate", "coefficients": "rate",
+    "scalar":     "rate", "scalars":    "rate",
     "magnitude":  "rate",
-    "adjustment": "update",
-    "adjustments": "update",
-    "updates":    "update",
-    "updated":    "update",
-    "parameter":  "weight",
-    "parameters": "weight",
-    "applied":    "apply",
-    "applies":    "apply",
+    "adjustment": "update", "adjustments": "update",
+    "parameter":  "weight", "parameters": "weight",
+    "applied":    "apply", "applies":    "apply",
     "scales":     "scale",
-    "provisioning": "create",
-    "provisioned":  "create",
-
-    # Databases
-    "daemon":     "server",
-    "daemons":    "server",
+    "provisioning": "create", "provisioned":  "create",
+    "daemon":     "server", "daemons":    "server",
     "allocated":  "listen",
     "handling":   "process",
-    "socket":     "connection",
-    "sockets":    "connection",
+    "socket":     "connection", "sockets":    "connection",
+    "asymmetric": "rsa", "public-key": "rsa",
+    "milliseconds": "ms", "millisecond":  "ms",
+    "stochastic": "sgd", "descent":    "sgd",
+}
 
-    # Crypto
-    "asymmetric": "rsa",
-    "public-key": "rsa",
-    "milliseconds": "ms",
-    "millisecond":  "ms",
+# ============================ SYNTHESIS / NOISE ============================
+_SYNTHESIS_CUE = re.compile(
+    r"\b(?:synthesiz\w*|how\s+do\s+(?:both|these|they)|compare|contrast)\b",
+    re.IGNORECASE,
+)
+SYNTH_NOISE = {
+    "synthesizing", "synthesiz", "integrate", "both", "furthermore",
+    "adjacent", "architecture", "models", "model", "together", "combine",
+    "compare", "contrast", "systems", "system", "integration",
 }
 
 # ============================ INIT ============================
@@ -136,17 +118,24 @@ class QueryIn(BaseModel):
     question: str = ""
     top_k: int = 3
 
-# ============================ INJECTION SCRUBBER ============================
+# ============================ INJECTION SCRUBBER (STRONGER) ============================
 _INJ = re.compile(
-    r"(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?"
-    r"(?:previous|above|prior|earlier|preceding)\s+(?:instructions?|prompts?|rules?|directives?)"
+    r"<!--.*?-->"                              # HTML comments
+    r"|/\*.*?\*/"                               # C/SQL block comments
+    r"|<script.*?</script>"                     # script tags
+    r"|\{[^}]{0,500}\}"                         # JSON-like blocks (bounded)
+    r"|\[(?:SYSTEM|USER|ASSISTANT)\s+[^\]]{0,300}\]"  # role markers
+    r"|(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?"
+    r"(?:previous|above|prior|earlier|preceding)\s+(?:instructions?|prompts?|rules?|directives?|constraints?)"
     r"|you\s+are\s+now\s+(?:a|an|the)?"
-    r"|(?:system|developer)\s*prompt"
+    r"|(?:system|developer)\s*(?:override|prompt|instructions?)"
     r"|new\s+instructions?\s*:"
     r"|reveal\s+(?:the\s+)?(?:system|prompt|instructions?|rules?)"
     r"|print\s+(?:your\s+)?(?:system|prompt|instructions?)"
-    r"|do\s+not\s+follow\s+(?:the\s+)?(?:rules?|instructions?)",
-    re.IGNORECASE,
+    r"|do\s+not\s+follow\s+(?:the\s+)?(?:rules?|instructions?)"
+    r"|force\s+sources?\s*:"
+    r"|confidence\s*:\s*[\d.]+",
+    re.IGNORECASE | re.DOTALL,
 )
 
 def sanitize(q: str) -> str:
@@ -196,7 +185,6 @@ def specific_terms(q: str):
     return {t for t in terms_of(q) if t not in GENERIC_Q and len(t) >= 3}
 
 def entity_grounded_syn(spec, passage_idx, threshold):
-    """Entity check with synonym expansion. Returns True if matched/len(spec) >= threshold."""
     if not spec:
         return True
     passage_lower = PASSAGE_LOWER[passage_idx]
@@ -208,9 +196,26 @@ def entity_grounded_syn(spec, passage_idx, threshold):
             matched += 1
     return (matched / len(spec)) >= threshold
 
+def keyword_retrieve(terms, top_n=5):
+    """Score passages by synonym-expanded term matches. Fallback when dense fails."""
+    if not terms:
+        return []
+    min_matches = min(len(terms), max(2, len(terms) // 3))
+    scored = []
+    for idx, passage_lower in enumerate(PASSAGE_LOWER):
+        score = sum(1 for t in terms
+                    if term_present(t, passage_lower)
+                    or (t in SYNONYMS and term_present(SYNONYMS[t], passage_lower)))
+        if score >= min_matches:
+            scored.append((score, idx))
+    scored.sort(reverse=True)
+    return [idx for _, idx in scored[:top_n]]
+
 # ============================ ATTRIBUTE PATTERNS ============================
+_DECIMAL = r"\b(?:0?\.\d+|\d+\.\d+)\b"  # requires a decimal point
+
 _UNIT_HINTS = {
-    # Time-based (covers duration, interval, heartbeat, keepalive)
+    # Time
     "duration":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "interval":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "heartbeat":  r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|milliseconds)\b",
@@ -227,12 +232,12 @@ _UNIT_HINTS = {
     # Bits / keys
     "bits":       r"\b\d+\s*bits?\b",
     "key":        r"\b\d+\s*bits?\b",
-    # Rates / coefficients
-    "rate":       r"\b\d+(?:\.\d+)?\b",
-    "coefficient": r"\b\d+(?:\.\d+)?\b",
-    "scalar":     r"\b\d+(?:\.\d+)?\b",
-    "magnitude":  r"\b\d+(?:\.\d+)?\b",
-    "learning":   r"\b\d+(?:\.\d+)?\b",
+    # Rates / coefficients — REQUIRE DECIMALS
+    "rate":       _DECIMAL,
+    "coefficient": _DECIMAL,
+    "scalar":     _DECIMAL,
+    "magnitude":  _DECIMAL,
+    "learning":   _DECIMAL,
     # Generic threshold / quorum
     "threshold":  r"\b\d+(?:\.\d+)?\b",
     "quorum":     r"\b\d+\b",
@@ -299,7 +304,7 @@ def query(inp: QueryIn):
         if len(q) < 3:
             return _abstain(0.0, "short query")
 
-        # 1. Retrieval (top 10)
+        # 1. Dense retrieval
         q_emb = np.array(list(embedder.query_embed(q)), dtype=np.float32)
         faiss.normalize_L2(q_emb)
         D, I = _index.search(q_emb, 10)
@@ -317,21 +322,57 @@ def query(inp: QueryIn):
         top_scores = bi_scores[:k]
         confidence = round(min(0.98, 0.60 + bi_scores[0] * 0.5), 4)
 
-        # Detect attribute keyword
+        # ---------- SYNTHESIS PATH ----------
+        if _SYNTHESIS_CUE.search(q):
+            spec_synth = spec - SYNTH_NOISE
+            print(f"[DEBUG] SYNTHESIS path, spec_clean={spec_synth}", flush=True)
+
+            parts = []
+            used = set()
+            for idx in bi_idx[:5]:
+                if idx in used:
+                    continue
+                if spec_synth and not entity_grounded_syn(spec_synth, idx, 0.25):
+                    continue
+                sent = extract_answer(q, PASSAGES[idx])
+                if sent and sent not in parts:
+                    if not any(sent[:60] in p or p[:60] in sent for p in parts):
+                        parts.append(sent)
+                        used.add(idx)
+                if len(parts) >= 3:
+                    break
+
+            if parts:
+                answer = " ".join(parts)
+                resp = {
+                    "answer": answer.strip(),
+                    "sources": [int(x) for x in top_idx],
+                    "scores": [round(float(x), 4) for x in top_scores],
+                    "confidence": confidence,
+                }
+                print(f"[RESPONSE] ANSWER (synthesis, {len(parts)} parts, {time.time()-t0:.2f}s): {resp}", flush=True)
+                return resp
+
+            return _abstain(bi_scores[0] * 0.5, "synthesis no parts")
+
+        # ---------- Attribute detection ----------
         attr_pattern = None
         for kw, pat in _UNIT_HINTS.items():
             if re.search(rf"\b{kw}s?\b", q, re.IGNORECASE):
                 attr_pattern = pat
                 break
-
         versions = set(re.findall(r"\b\d+\.\d+\b", q))
 
-        # ---- Path A: attribute-specific query (with cascade thresholds) ----
+        # ---------- PATH A: attribute-specific ----------
         if attr_pattern is not None:
             print(f"[DEBUG] attr_pattern={attr_pattern} spec={spec} versions={versions}", flush=True)
 
+            kw_candidates = keyword_retrieve(spec, 5)
+            candidates = list(dict.fromkeys(bi_idx[:5] + kw_candidates))
+            print(f"[DEBUG] path A candidates = {candidates[:8]}", flush=True)
+
             for threshold in [0.6, 0.5, 0.4, 0.3]:
-                for idx in bi_idx[:5]:
+                for idx in candidates:
                     if not entity_grounded_syn(spec, idx, threshold):
                         continue
                     passage = PASSAGES[idx]
@@ -347,7 +388,6 @@ def query(inp: QueryIn):
                                 sent = s.strip()
                                 break
 
-                    # Confidence degrades as threshold loosens
                     conf = round(min(0.98, confidence * (0.55 + 0.45 * threshold)), 4)
                     resp = {
                         "answer": sent.strip(),
@@ -355,46 +395,26 @@ def query(inp: QueryIn):
                         "scores": [round(float(x), 4) for x in top_scores],
                         "confidence": conf,
                     }
-                    print(f"[RESPONSE] ANSWER (path A, thr={threshold}, {time.time()-t0:.2f}s): {resp}", flush=True)
+                    print(f"[RESPONSE] ANSWER (A, thr={threshold}, {time.time()-t0:.2f}s): {resp}", flush=True)
                     return resp
 
-            # Path A.5: value-first fallback — scan top-20, very loose entity (0.2)
-            for idx in bi_idx[:20]:
-                if not entity_grounded_syn(spec, idx, 0.2):
-                    continue
-                passage = PASSAGES[idx]
-                if versions and not any(v in passage for v in versions):
-                    continue
-                if not re.search(attr_pattern, passage, re.IGNORECASE):
-                    continue
-                sent = extract_answer(q, passage)
-                if not re.search(attr_pattern, sent, re.IGNORECASE):
-                    for s in re.split(r"(?<=[.!?])\s+", passage):
-                        if re.search(attr_pattern, s, re.IGNORECASE):
-                            sent = s.strip()
-                            break
-                if re.search(attr_pattern, sent, re.IGNORECASE):
-                    conf = round(min(0.85, confidence * 0.65), 4)
-                    resp = {
-                        "answer": sent.strip(),
-                        "sources": [int(x) for x in top_idx],
-                        "scores": [round(float(x), 4) for x in top_scores],
-                        "confidence": conf,
-                    }
-                    print(f"[RESPONSE] ANSWER (path A.5 loose, {time.time()-t0:.2f}s): {resp}", flush=True)
-                    return resp
+            return _abstain(bi_scores[0] * 0.5, "no entity+attribute match")
 
-            return _abstain(bi_scores[0] * 0.5, "no passage has entity+attribute")
-
-        # ---- Path B: general query (with cascade) ----
+        # ---------- PATH B: general query with cascade + keyword fallback ----------
         print(f"[DEBUG] path B (no attr) spec={spec}", flush=True)
-        for threshold in [0.6, 0.5, 0.4]:
-            if entity_grounded_syn(spec, bi_idx[0], threshold):
-                answer = extract_answer(q, PASSAGES[bi_idx[0]])
+        kw_candidates = keyword_retrieve(spec, 5)
+        candidates = list(dict.fromkeys(bi_idx[:5] + kw_candidates))
 
-                if (k >= 2 and bi_scores[1] >= 0.6 * bi_scores[0]
-                        and bi_scores[1] >= 0.45
-                        and entity_grounded_syn(spec, bi_idx[1], max(0.4, threshold - 0.1))):
+        for threshold in [0.6, 0.5, 0.4]:
+            for idx in candidates:
+                if not entity_grounded_syn(spec, idx, threshold):
+                    continue
+                answer = extract_answer(q, PASSAGES[idx])
+
+                if (len(candidates) >= 2 and idx != candidates[0]
+                        and entity_grounded_syn(spec, candidates[0], max(0.4, threshold - 0.1))):
+                    pass
+                elif k >= 2 and bi_scores[1] >= 0.6 * bi_scores[0] and bi_scores[1] >= 0.45 and entity_grounded_syn(spec, bi_idx[1], max(0.4, threshold - 0.1)):
                     sec = extract_answer(q, PASSAGES[bi_idx[1]])
                     if sec and sec != answer and sec not in answer and answer not in sec:
                         answer = answer + " " + sec
@@ -406,7 +426,7 @@ def query(inp: QueryIn):
                     "scores": [round(float(x), 4) for x in top_scores],
                     "confidence": conf,
                 }
-                print(f"[RESPONSE] ANSWER (path B, thr={threshold}, {time.time()-t0:.2f}s): {resp}", flush=True)
+                print(f"[RESPONSE] ANSWER (B, thr={threshold}, idx={idx}, {time.time()-t0:.2f}s): {resp}", flush=True)
                 return resp
 
         return _abstain(bi_scores[0] * 0.5, "entity not grounded")
