@@ -60,33 +60,26 @@ PASSAGES = [
     "JSON Web Tokens transmit cryptographically verifiable claims between distributed services in compact URL-safe strings. Digital signatures verify JWT payload tampering by generating cryptographic signatures using SHA-256 digests. Verification middleware rejects expired tokens when expiration timestamp differences exceed a 250ms clock skew threshold. Tokens comprise base64url-encoded header, payload, and cryptographic signature segments separated by periods. Stateless microservices use JWTs to transmit authenticated identity claims without querying central session stores.",
 ]
 
-# ============================ MODEL INIT (FASTEMBED) ============================
-print("[init] loading fastembed model ...")
+# ============================ INIT ============================
+print("[init] loading fastembed ...", flush=True)
 embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-print("[init] building FAISS index ...")
+print("[init] building FAISS index ...", flush=True)
 _passage_embs = np.stack(list(embedder.embed(PASSAGES)), axis=0).astype(np.float32)
 faiss.normalize_L2(_passage_embs)
 _index = faiss.IndexFlatIP(_passage_embs.shape[1])
 _index.add(_passage_embs)
-
 PASSAGE_LOWER = [p.lower() for p in PASSAGES]
 
-app = FastAPI(title="KB-RAG (fastembed)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="KB-RAG")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
+                   allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["*"])
 
 class QueryIn(BaseModel):
     question: str = ""
     top_k: int = 3
 
-# --- prompt-injection scrubber ---
+# ============================ INJECTION SCRUBBER ============================
 _INJ = re.compile(
     r"(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?"
     r"(?:previous|above|prior|earlier|preceding)\s+(?:instructions?|prompts?|rules?|directives?)"
@@ -102,10 +95,9 @@ _INJ = re.compile(
 def sanitize(q: str) -> str:
     if not q:
         return ""
-    q = _INJ.sub(" ", q)
-    return re.sub(r"\s+", " ", q).strip()
+    return re.sub(r"\s+", " ", _INJ.sub(" ", q)).strip()
 
-# --- lexicon helpers ---
+# ============================ LEXICON ============================
 STOP = set("""
 a an the of to in on at by for with from as is are was were be been being this that these those
 it its and or but if then else so than which who whom whose what when where why how
@@ -124,6 +116,10 @@ GENERIC_Q = {
     "amount", "quantity", "high", "low", "maximum", "minimum", "max", "min",
     "recommended", "common", "total", "average", "mean",
     "key", "get", "set", "put", "run", "map", "add", "end", "top", "sub",
+    "listen", "listens", "listening", "bind", "binds", "binding",
+    "connect", "connects", "accept", "accepts",
+    "need", "needs", "require", "requires",
+    "send", "sends", "receive", "receives",
 }
 
 def terms_of(text: str, min_len: int = 3):
@@ -138,36 +134,34 @@ def term_present(term: str, text_lower: str) -> bool:
     return False
 
 def specific_terms(q: str):
-    # 3+ char, non-generic, non-stop terms are considered specific
     return {t for t in terms_of(q) if t not in GENERIC_Q and len(t) >= 3}
 
-def grounded_in_topk(specific, top_indices, ratio=0.5):
-    if not specific:
+def entity_grounded(spec, passage_idx, base_threshold=0.6):
+    if not spec:
         return True
-    present = sum(
-        1 for t in specific
-        if any(term_present(t, PASSAGE_LOWER[i]) for i in top_indices)
-    )
-    return present / len(specific) >= ratio
+    threshold = 1.0 if len(spec) <= 2 else base_threshold
+    passage_lower = PASSAGE_LOWER[passage_idx]
+    present = sum(1 for t in spec if term_present(t, passage_lower))
+    return (present / len(spec)) >= threshold
 
-# --- attribute hints ---
-_NUMERIC_HINT = re.compile(
-    r"\b(?:port|rate|interval|timeout|threshold|size|count|number|bits?|capacity|amount|value|limit|quorum|blocks?|layers?|samples?)\b",
-    re.IGNORECASE,
-)
-
+# ============================ ATTRIBUTE PATTERNS ============================
 _UNIT_HINTS = {
     "interval":  r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "timeout":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
     "latency":   r"\b\d+(?:\.\d+)?\s*(?:ms|s\b|sec|secs|seconds|milliseconds)\b",
-    "port":      r"\b\d{4,5}\b",
-    "size":      r"\b\d+(?:\.\d+)?\s*(?:GB|MB|KB|bytes?|bits?|blocks?|layers?)\b",
+    "port":      r"\bport\s+\d{2,5}\b",
+    "size":      r"\b\d+(?:\.\d+)?\s*(?:GB|MB|KB|bytes?|bits?|blocks?|layers?|samples?|records?|chunks?|tokens?|nodes?)\b",
     "length":    r"\b\d+(?:\.\d+)?\s*(?:GB|MB|KB|bytes?|bits?|tokens?|blocks?|layers?)\b",
     "bits":      r"\b\d+\s*bits?\b",
     "rate":      r"\b\d+(?:\.\d+)?\s*%?\b",
     "threshold": r"\b\d+(?:\.\d+)?\b",
     "quorum":    r"\b\d+\b",
 }
+
+_NUMERIC_HINT = re.compile(
+    r"\b(?:how\s+many|how\s+much|port|rate|interval|timeout|threshold|size|count|number|bits?|capacity|amount|value|limit|quorum|blocks?|layers?|samples?)\b",
+    re.IGNORECASE,
+)
 
 def _stem(t: str) -> str:
     return t[:5] if len(t) >= 5 else t
@@ -203,9 +197,12 @@ def extract_answer(question: str, passage: str) -> str:
             best_score, best_sent = score, s
     return best_sent
 
-def _abstain(conf: float):
-    return {"answer": None, "sources": [], "scores": [],
+def _abstain(conf: float, reason: str = ""):
+    resp = {"answer": None, "sources": [], "scores": [],
             "confidence": round(float(min(max(conf, 0.0), 0.39)), 4)}
+    if reason:
+        print(f"[RESPONSE] ABSTAIN ({reason}): {resp}", flush=True)
+    return resp
 
 # ============================ ROUTES ============================
 @app.get("/health")
@@ -214,84 +211,90 @@ def health():
 
 @app.post("/query")
 def query(inp: QueryIn):
+    t0 = time.time()
+    print(f"[QUERY] {inp.question!r} (top_k={inp.top_k})", flush=True)
+
     try:
         q = sanitize((inp.question or "").strip())
         if len(q) < 3:
-            return _abstain(0.0)
+            return _abstain(0.0, "short query")
 
-        # 1) Retrieval
+        # 1. Retrieval
         q_emb = np.array(list(embedder.query_embed(q)), dtype=np.float32)
         faiss.normalize_L2(q_emb)
         D, I = _index.search(q_emb, 10)
         bi_idx = [int(x) for x in I[0]]
         bi_scores = [float(x) for x in D[0]]
 
+        print(f"[DEBUG] top-5 retrieval = {[(i, round(s,3)) for i, s in zip(bi_idx[:5], bi_scores[:5])]}", flush=True)
+
         if bi_scores[0] < 0.28:
-            return _abstain(bi_scores[0])
+            return _abstain(bi_scores[0], "low cosine")
 
         spec = specific_terms(q)
+        k = max(1, min(inp.top_k or 3, 10))
+        top_idx = bi_idx[:k]
+        top_scores = bi_scores[:k]
+        confidence = round(min(0.98, 0.60 + bi_scores[0] * 0.5), 4)
 
-        # Detect attribute type
         attr_pattern = None
         for kw, pat in _UNIT_HINTS.items():
             if re.search(rf"\b{kw}s?\b", q, re.IGNORECASE):
                 attr_pattern = pat
                 break
-
-        k = max(1, min(inp.top_k or 3, 10))
-        top_idx_k = bi_idx[:k]
-        top_scores_k = bi_scores[:k]
-        confidence = round(min(0.98, 0.60 + bi_scores[0] * 0.5), 4)
+        versions = set(re.findall(r"\b\d+\.\d+\b", q))
 
         # ---- Path A: attribute-specific query ----
         if attr_pattern is not None:
+            print(f"[DEBUG] attr_pattern={attr_pattern} spec={spec} versions={versions}", flush=True)
             for idx in bi_idx[:5]:
-                passage = PASSAGES[idx]
-                passage_lower = PASSAGE_LOWER[idx]
-
-                # (a) queried entity appears in this passage?
-                if spec and not any(term_present(t, passage_lower) for t in spec):
+                if not entity_grounded(spec, idx):
                     continue
-                # (b) a value of the queried attribute type exists in this passage?
+                passage = PASSAGES[idx]
+                if versions and not any(v in passage for v in versions):
+                    continue
                 if not re.search(attr_pattern, passage, re.IGNORECASE):
                     continue
 
                 sent = extract_answer(q, passage)
-                # Ensure the extracted sentence actually contains the attribute
                 if not re.search(attr_pattern, sent, re.IGNORECASE):
                     for s in re.split(r"(?<=[.!?])\s+", passage):
                         if re.search(attr_pattern, s, re.IGNORECASE):
                             sent = s.strip()
                             break
 
-                return {
+                resp = {
                     "answer": sent.strip(),
-                    "sources": top_idx_k,
-                    "scores": [round(float(x), 4) for x in top_scores_k],
+                    "sources": [int(x) for x in top_idx],
+                    "scores": [round(float(x), 4) for x in top_scores],
                     "confidence": confidence,
                 }
-
-            # Nothing in top-5 had both the entity AND the attribute → abstain
-            return _abstain(bi_scores[0] * 0.5)
+                print(f"[RESPONSE] ANSWER (path A, {time.time()-t0:.2f}s): {resp}", flush=True)
+                return resp
+            return _abstain(bi_scores[0] * 0.5, "no passage has entity+attribute")
 
         # ---- Path B: general query ----
-        if spec and not grounded_in_topk(spec, bi_idx[:3], ratio=0.5):
-            return _abstain(bi_scores[0] * 0.5)
+        if spec and not entity_grounded(spec, bi_idx[0]):
+            return _abstain(bi_scores[0] * 0.5, "entity not grounded")
 
         answer = extract_answer(q, PASSAGES[bi_idx[0]])
 
-        # Multi-hop synthesis
-        if k >= 2 and bi_scores[1] >= 0.6 * bi_scores[0] and bi_scores[1] >= 0.45:
+        if (k >= 2 and bi_scores[1] >= 0.6 * bi_scores[0]
+                and bi_scores[1] >= 0.45
+                and entity_grounded(spec, bi_idx[1], base_threshold=0.5)):
             sec = extract_answer(q, PASSAGES[bi_idx[1]])
             if sec and sec != answer and sec not in answer and answer not in sec:
                 answer = answer + " " + sec
 
-        return {
+        resp = {
             "answer": answer.strip(),
-            "sources": top_idx_k,
-            "scores": [round(float(x), 4) for x in top_scores_k],
+            "sources": [int(x) for x in top_idx],
+            "scores": [round(float(x), 4) for x in top_scores],
             "confidence": confidence,
         }
+        print(f"[RESPONSE] ANSWER (path B, {time.time()-t0:.2f}s): {resp}", flush=True)
+        return resp
+
     except Exception as e:
-        print(f"[error] {e}")
-        return _abstain(0.0)
+        print(f"[error] {e}", flush=True)
+        return _abstain(0.0, f"exception: {e}")
