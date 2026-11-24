@@ -1,1 +1,27 @@
+# Git
+.git
+.gitignore
 
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local model / HF caches
+.cache/
+.huggingface/
+
+# IDE / OS junk
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local testing artifacts
+test_local.py
+*.log
