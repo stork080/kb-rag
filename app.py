@@ -4,9 +4,9 @@ import faiss
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from fastembed import TextEmbedding
 
-# ============================ KNOWLEDGE BASE ============================
+# ============================ KNOWLEDGE BASE (50 PASSAGES) ============================
 PASSAGES = [
     "Raft consensus requires a quorum of 4 nodes to commit a log entry. The leader sends 150ms heartbeats to prevent follower election timeouts. Network partitions cause the minority partition to stop accepting writes. Log compaction via snapshotting reduces replay time after a crash. etcd and CockroachDB both implement Raft for replicated state machines.",
     "Multi-Paxos consensus coordinates distributed replicated state without a single permanent master. Leader leases establish proposal rights for lease terms of 1000ms before re-election. In the accept phase, a commit quorum of 5 acceptors must acknowledge the ballot number. Proposers resolve ballot conflicts through randomized backoff intervals. Google Chubby and Apache ZooKeeper incorporate Paxos-family consensus protocols.",
@@ -60,27 +60,22 @@ PASSAGES = [
     "JSON Web Tokens transmit cryptographically verifiable claims between distributed services in compact URL-safe strings. Digital signatures verify JWT payload tampering by generating cryptographic signatures using SHA-256 digests. Verification middleware rejects expired tokens when expiration timestamp differences exceed a 250ms clock skew threshold. Tokens comprise base64url-encoded header, payload, and cryptographic signature segments separated by periods. Stateless microservices use JWTs to transmit authenticated identity claims without querying central session stores.",
 ]
 
-# ============================ MODEL INIT ============================
-print("[init] loading sentence-transformer ...")
-embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-try:
-    print("[init] loading cross-encoder reranker ...")
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-except Exception as e:
-    print(f"[init] reranker unavailable ({e}); falling back to bi-encoder scores")
-    reranker = None
+# ============================ MODEL INIT (FASTEMBED) ============================
+print("[init] loading fastembed model (all-MiniLM-L6-v2) ...")
+# fastembed downloads and caches the ONNX model on first run
+embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 print("[init] building FAISS index ...")
-_emb = embedder.encode(PASSAGES, normalize_embeddings=True,
-                       convert_to_numpy=True, show_progress_bar=False).astype(np.float32)
-_index = faiss.IndexFlatIP(_emb.shape[1])
-_index.add(_emb)
+# embed() returns a generator of numpy arrays; materialize to a list then stack
+_passage_embs = np.stack(list(embedder.embed(PASSAGES)), axis=0).astype(np.float32)
+faiss.normalize_L2(_passage_embs)  # L2-normalize for cosine similarity via inner product
+_index = faiss.IndexFlatIP(_passage_embs.shape[1])
+_index.add(_passage_embs)
 
 PASSAGE_LOWER = [p.lower() for p in PASSAGES]
 
 # ============================ APP ============================
-app = FastAPI(title="KB-RAG")
+app = FastAPI(title="KB-RAG (fastembed)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,13 +85,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class QueryIn(BaseModel):
     question: str = ""
     top_k: int = 3
 
-
-# --- prompt-injection scrubber (defence in depth) ---
+# --- prompt-injection scrubber ---
 _INJ = re.compile(
     r"(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+)?(?:of\s+)?(?:the\s+)?"
     r"(?:previous|above|prior|earlier|preceding)\s+(?:instructions?|prompts?|rules?|directives?)"
@@ -109,15 +102,13 @@ _INJ = re.compile(
     re.IGNORECASE,
 )
 
-
 def sanitize(q: str) -> str:
     if not q:
         return ""
     q = _INJ.sub(" ", q)
     return re.sub(r"\s+", " ", q).strip()
 
-
-# --- lexicon helpers ---
+# --- lexicon helpers (unchanged) ---
 STOP = set("""
 a an the of to in on at by for with from as is are was were be been being this that these those
 it its and or but if then else so than which who whom whose what when where why how
@@ -137,11 +128,9 @@ GENERIC_Q = {
     "recommended", "common", "total", "average", "mean",
 }
 
-
 def terms_of(text: str, min_len: int = 3):
     return {t for t in re.findall(r"[a-z0-9]+", text.lower())
             if len(t) >= min_len and t not in STOP}
-
 
 def term_present(term: str, text_lower: str) -> bool:
     if term in text_lower:
@@ -150,10 +139,8 @@ def term_present(term: str, text_lower: str) -> bool:
         return True
     return False
 
-
 def specific_terms(q: str):
     return {t for t in terms_of(q) if t not in GENERIC_Q and len(t) >= 4}
-
 
 def grounded_in_topk(specific, top_indices, ratio=0.5):
     if not specific:
@@ -164,13 +151,11 @@ def grounded_in_topk(specific, top_indices, ratio=0.5):
     )
     return present / len(specific) >= ratio
 
-
-# --- extractive QA ---
+# --- extractive QA (unchanged) ---
 _NUMERIC_HINT = re.compile(
     r"\b(?:port|rate|interval|timeout|threshold|size|count|number|bits?|capacity|amount|value|limit|quorum|blocks?|layers?|samples?)\b",
     re.IGNORECASE,
 )
-
 
 def extract_answer(question: str, passage: str) -> str:
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", passage.strip()) if s.strip()]
@@ -194,7 +179,6 @@ def extract_answer(question: str, passage: str) -> str:
             best_score, best_sent = score, s
     return best_sent
 
-
 def _abstain(conf: float):
     return {
         "answer": None,
@@ -203,12 +187,10 @@ def _abstain(conf: float):
         "confidence": round(float(min(max(conf, 0.0), 0.39)), 4),
     }
 
-
 # ============================ ROUTES ============================
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
 
 @app.post("/query")
 def query(inp: QueryIn):
@@ -217,42 +199,33 @@ def query(inp: QueryIn):
         if len(q) < 3:
             return _abstain(0.0)
 
-        # 1) bi-encoder retrieval (top 10)
-        q_emb = embedder.encode([q], normalize_embeddings=True,
-                                convert_to_numpy=True).astype(np.float32)
+        # 1) Embed query with fastembed (use query_embed for best retrieval)
+        #    query_embed returns a generator; take the first (and only) vector
+        q_emb = np.array(list(embedder.query_embed(q)), dtype=np.float32)
+        faiss.normalize_L2(q_emb)
+
+        # 2) Search full index
         D, I = _index.search(q_emb, 10)
         bi_idx = [int(x) for x in I[0]]
         bi_scores = [float(x) for x in D[0]]
         bi_max = bi_scores[0]
 
-        # 2) rerank
-        if reranker is not None:
-            pairs = [(q, PASSAGES[i]) for i in bi_idx]
-            raw = reranker.predict(pairs)
-            if isinstance(raw, (float, int, np.floating)):
-                raw = [float(raw)]
-            logits = [float(x) for x in raw]
-            sig = [1.0 / (1.0 + np.exp(-x)) for x in logits]
-            order = np.argsort(-np.asarray(sig))
-            rer_idx = [bi_idx[j] for j in order]
-            rer_scores = [float(sig[j]) for j in order]
-        else:
-            rer_idx = bi_idx
-            rer_scores = bi_scores
-        rer_max = rer_scores[0]
+        # 3) No reranker — use bi-encoder scores directly
+        rer_idx = bi_idx
+        rer_scores = bi_scores
+        rer_max = bi_max
 
-        # 3) soft abstention thresholds
+        # 4) Soft abstention thresholds
         if bi_max < 0.28 or rer_max < 0.30:
             return _abstain(max(bi_max, rer_max))
 
-        # 4) entity grounding: at least half of the question's specific
-        #    entities must appear somewhere in the top-3 passages
+        # 5) Entity grounding check
         spec = specific_terms(q)
         top3 = rer_idx[:3]
         if not grounded_in_topk(spec, top3, ratio=0.5):
             return _abstain(rer_max * 0.5)
 
-        # 5) build response
+        # 6) Build response
         k = max(1, min(inp.top_k or 3, 10))
         top_idx = rer_idx[:k]
         top_scores = rer_scores[:k]
@@ -260,7 +233,7 @@ def query(inp: QueryIn):
         primary = extract_answer(q, PASSAGES[top_idx[0]])
         answer = primary
 
-        # 6) multi-hop synthesis: append second passage when it is also strong
+        # 7) Multi-hop synthesis (only if second passage is strong)
         if k >= 2 and top_scores[1] >= 0.6 * top_scores[0] and top_scores[1] >= 0.45:
             sec = extract_answer(q, PASSAGES[top_idx[1]])
             if sec and sec != primary and sec not in primary and primary not in sec:
